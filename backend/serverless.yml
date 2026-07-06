@@ -1,0 +1,287 @@
+service: mrsushi-backend
+
+frameworkVersion: '3'
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-step-functions
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  environment:
+    STAGE: ${self:provider.stage}
+    TENANT_ID: mrsushi                 # Restaurante = tenant. Mismo backend soporta mas tenants a futuro.
+    USERS_TABLE: ${self:service}-users-${self:provider.stage}
+    ORDERS_TABLE: ${self:service}-orders-${self:provider.stage}
+    EVENT_BUS_NAME: ${self:service}-bus-${self:provider.stage}
+    JWT_SECRET: ${env:JWT_SECRET, 'cambia-este-secreto-en-produccion'}
+    STATE_MACHINE_ARN: !Ref PedidoWorkflowStateMachine
+
+  httpApi:
+    cors: true
+
+# ================== FUNCTIONS ==================
+functions:
+
+  # ----- Auth (usado por la web de clientes) -----
+  register:
+    handler: src/handlers/auth/register.handler
+    events:
+      - httpApi: 'POST /auth/register'
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [dynamodb:PutItem, dynamodb:GetItem]
+        Resource: !GetAtt UsersTable.Arn
+
+  login:
+    handler: src/handlers/auth/login.handler
+    events:
+      - httpApi: 'POST /auth/login'
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [dynamodb:GetItem]
+        Resource: !GetAtt UsersTable.Arn
+
+  # ----- Pedidos (cliente web + api Rappi en otra nube pueden llamar aqui) -----
+  createOrder:
+    handler: src/handlers/orders/createOrder.handler
+    events:
+      - httpApi: 'POST /orders'
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [dynamodb:PutItem]
+        Resource: !GetAtt OrdersTable.Arn
+      - Effect: Allow
+        Action: [events:PutEvents]
+        Resource: !GetAtt PedidosEventBus.Arn
+
+  getOrder:
+    handler: src/handlers/orders/getOrder.handler
+    events:
+      - httpApi: 'GET /orders/{orderId}'
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [dynamodb:GetItem]
+        Resource: !GetAtt OrdersTable.Arn
+
+  listMyOrders:
+    handler: src/handlers/orders/listOrders.handler
+    events:
+      - httpApi: 'GET /orders'
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [dynamodb:Query]
+        Resource:
+          - !GetAtt OrdersTable.Arn
+          - !Sub '${OrdersTable.Arn}/index/userEmail-index'
+
+  # ----- Consumidor de eventos del workflow: persiste el taskToken de Step Functions -----
+  onWorkflowEvent:
+    handler: src/handlers/workflow/onWorkflowEvent.handler
+    events:
+      - eventBridge:
+          eventBus: !GetAtt PedidosEventBus.Arn
+          pattern:
+            source: [mrsushi.workflow]
+            detail-type: [CocinaPendiente, EmpaquePendiente, EntregaPendiente]
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [dynamodb:UpdateItem]
+        Resource: !GetAtt OrdersTable.Arn
+
+  # ----- Usados por la web de TRABAJADORES para avanzar el pedido -----
+  iniciarPaso:
+    handler: src/handlers/workflow/iniciarPaso.handler
+    events:
+      - httpApi: 'POST /orders/{orderId}/steps/{step}/iniciar'
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [dynamodb:UpdateItem, dynamodb:GetItem]
+        Resource: !GetAtt OrdersTable.Arn
+
+  completarPaso:
+    handler: src/handlers/workflow/completarPaso.handler
+    events:
+      - httpApi: 'POST /orders/{orderId}/steps/{step}/completar'
+    iamRoleStatements:
+      - Effect: Allow
+        Action: [dynamodb:UpdateItem, dynamodb:GetItem]
+        Resource: !GetAtt OrdersTable.Arn
+      - Effect: Allow
+        Action: [states:SendTaskSuccess, states:SendTaskFailure]
+        Resource: '*'
+      - Effect: Allow
+        Action: [events:PutEvents]
+        Resource: !GetAtt PedidosEventBus.Arn
+
+# ================== STEP FUNCTIONS ==================
+stepFunctions:
+  stateMachines:
+    pedidoWorkflow:
+      name: ${self:service}-pedido-workflow-${self:provider.stage}
+      id: PedidoWorkflowStateMachine
+      definition:
+        Comment: "Flujo de un pedido: cocina -> empaque -> entrega, usando Wait for Callback with Task Token"
+        StartAt: EsperarCocina
+        States:
+
+          EsperarCocina:
+            Type: Task
+            Resource: arn:aws:states:::events:putEvents.waitForTaskToken
+            Parameters:
+              Entries:
+                - Detail:
+                    orderId.$: "$.orderId"
+                    tenantId.$: "$.tenantId"
+                    taskToken.$: "$$.Task.Token"
+                  DetailType: CocinaPendiente
+                  EventBusName: ${self:provider.environment.EVENT_BUS_NAME}
+                  Source: mrsushi.workflow
+            ResultPath: "$.resultadoCocina"
+            Next: EsperarEmpaque
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: PedidoFallido
+
+          EsperarEmpaque:
+            Type: Task
+            Resource: arn:aws:states:::events:putEvents.waitForTaskToken
+            Parameters:
+              Entries:
+                - Detail:
+                    orderId.$: "$.orderId"
+                    tenantId.$: "$.tenantId"
+                    taskToken.$: "$$.Task.Token"
+                  DetailType: EmpaquePendiente
+                  EventBusName: ${self:provider.environment.EVENT_BUS_NAME}
+                  Source: mrsushi.workflow
+            ResultPath: "$.resultadoEmpaque"
+            Next: EsperarEntrega
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: PedidoFallido
+
+          EsperarEntrega:
+            Type: Task
+            Resource: arn:aws:states:::events:putEvents.waitForTaskToken
+            Parameters:
+              Entries:
+                - Detail:
+                    orderId.$: "$.orderId"
+                    tenantId.$: "$.tenantId"
+                    taskToken.$: "$$.Task.Token"
+                  DetailType: EntregaPendiente
+                  EventBusName: ${self:provider.environment.EVENT_BUS_NAME}
+                  Source: mrsushi.workflow
+            ResultPath: "$.resultadoEntrega"
+            Next: PedidoEntregado
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: PedidoFallido
+
+          PedidoEntregado:
+            Type: Succeed
+
+          PedidoFallido:
+            Type: Fail
+            Error: "PedidoNoCompletado"
+
+# ================== RESOURCES ==================
+resources:
+  Resources:
+
+    UsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.USERS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenantId
+            AttributeType: S
+          - AttributeName: email
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenantId
+            KeyType: HASH
+          - AttributeName: email
+            KeyType: RANGE
+
+    OrdersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ORDERS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenantId
+            AttributeType: S
+          - AttributeName: orderId
+            AttributeType: S
+          - AttributeName: userEmail
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenantId
+            KeyType: HASH
+          - AttributeName: orderId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: userEmail-index
+            KeySchema:
+              - AttributeName: userEmail
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    PedidosEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:provider.environment.EVENT_BUS_NAME}
+
+    # Regla: cuando createOrder publica "OrderCreated", arranca el Step Functions
+    OrderCreatedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: !Ref PedidosEventBus
+        EventPattern:
+          source: ["mrsushi.orders"]
+          detail-type: ["OrderCreated"]
+        Targets:
+          - Arn: !Ref PedidoWorkflowStateMachine
+            Id: PedidoWorkflowTarget
+            RoleArn: !GetAtt EventBridgeToStepFunctionsRole.Arn
+            InputTransformer:
+              InputPathsMap:
+                orderId: "$.detail.orderId"
+                tenantId: "$.detail.tenantId"
+              InputTemplate: '{"orderId": <orderId>, "tenantId": <tenantId>}'
+
+    EventBridgeToStepFunctionsRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: InvokeStepFunctions
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: states:StartExecution
+                  Resource: !Ref PedidoWorkflowStateMachine
+
+  Outputs:
+    HttpApiUrl:
+      Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    EventBusName:
+      Value: !Ref PedidosEventBus
