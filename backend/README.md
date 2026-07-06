@@ -65,16 +65,3 @@ npx serverless deploy --stage dev
 
 Al terminar, `serverless deploy` imprime el output `HttpApiUrl`. Copia esa URL a
 `VITE_API_URL` en el frontend (archivo `.env` o `src/utils/api.js`).
-
-## Qué falta para el proyecto completo (no incluido aquí)
-
-- **Web de trabajadores**: un frontend que liste pedidos con `steps.*.status === 'DISPONIBLE'`
-  y llame a `/steps/{step}/iniciar` y `/steps/{step}/completar`. La API ya está lista para eso.
-- **API en otra nube simulando Rappi** (OCI/GCP/Azure): un segundo API REST que llame a este
-  mismo `POST /orders` con `canal: "rappi"` y `cliente: {nombre, email}` en el body (no requiere
-  JWT en ese caso). Y un tercer endpoint aquí para que, en cada paso completado, un Lambda le
-  avise a Rappi (puedes engancharlo al evento `OrderStatusChanged`).
-- **Dashboard resumen** para la web de trabajadores (puede alimentarse de un `Scan`/`Query`
-  sobre `OrdersTable`, o de un consumidor de `OrderStatusChanged` que agregue métricas en otra tabla).
-- **Diagrama de arquitectura formal** para el informe (2 puntos de la rúbrica) — con esta
-  descripción y el `serverless.yml` ya tienes todos los componentes para dibujarlo.
